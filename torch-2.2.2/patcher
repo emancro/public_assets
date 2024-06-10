@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+
+"""Apply patches to a Python wheel file."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+from wheel.wheelfile import WheelFile  # type: ignore
+
+
+def no_backup_option(patch_prog: Path) -> list[str]:
+    tool_version = subprocess.check_output((str(patch_prog), "--version"))
+    if tool_version.startswith(b"GNU patch "):
+        return ["--no-backup-if-mismatch"]
+    elif tool_version.endswith(b"Apple\n"):
+        return ["--version-control", "none"]
+    else:
+        print("Unknown 'patch' tool. Cannot determine no-backup option.")
+        return []
+
+
+def update_metadata_version(
+    wheel_dir: str, dist_info_path: str, version: str, suffix: str
+) -> None:
+    """Update dist-info/METADATA with the new version and suffix."""
+    metadata_path = Path(wheel_dir).joinpath(dist_info_path, "METADATA")
+    metadata = []
+    with metadata_path.open("r") as f:
+        for line in f:
+            if line.startswith("Version:"):
+                assert line == f"Version: {version}\n"
+                metadata.append(f"Version: {version}{suffix}\n")
+                print(metadata[-1])
+            else:
+                metadata.append(line)
+
+    with metadata_path.open("w") as f:
+        f.write("".join(metadata))
+
+
+def patch_wheel(
+    src_wheel: Path,
+    dest_dir: Path,
+    patch_dir: Path,
+    suffix: str,
+    patch_prog: Path,
+    strip_count: int,
+) -> tuple[Path, str]:
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        with WheelFile(src_wheel) as w:
+            old_dist_info_path = w.dist_info_path
+            grp = w.parsed_filename.group
+            namever = grp("namever")
+            version = grp("ver")
+            if not suffix.startswith("+"):
+                suffix = "+" + suffix
+            if "+" in version:
+                # e.g., version='2.1.2+cu118'. Two '+'s are not allowed in the wheel filename.
+                suffix = suffix.replace("+", "_")
+            new_dist_info_path = "{}{}.dist-info".format(namever, suffix)
+            requirement = f"{grp('name')}=={version}{suffix}"
+            new_wheel_filename = "{namever}{suffix}-{pyver}-{abi}-{plat}.whl".format(
+                namever=namever,
+                suffix=suffix,
+                pyver=grp("pyver"),
+                abi=grp("abi"),
+                plat=grp("plat"),
+            )
+            new_wheel_path = dest_dir.joinpath(new_wheel_filename)
+            print(f"Extracting {src_wheel} to {temp_dir}")
+            w.extractall(temp_dir)
+
+        discard_backups_option = no_backup_option(patch_prog)
+        for patch in sorted(os.listdir(patch_dir)):
+            patch_path = patch_dir.absolute().joinpath(patch)
+            patch_cmd = [
+                str(patch_prog),
+                f"--strip={strip_count}",
+                f"--input={patch_path}",
+            ] + discard_backups_option
+            print(f"\t{shlex.join(patch_cmd)}")
+            subprocess.check_call(patch_cmd, cwd=temp_dir)
+
+        os.rename(
+            os.path.join(temp_dir, old_dist_info_path),
+            os.path.join(temp_dir, new_dist_info_path),
+        )
+
+        update_metadata_version(temp_dir, new_dist_info_path, version, suffix)
+
+        with WheelFile(new_wheel_path, "w") as w:
+            print(f"Repacking wheel as {new_wheel_path}")
+            w.write_files(temp_dir)
+
+        return new_wheel_path, requirement
+
+    finally:
+        # Clean up the temporary directory
+        shutil.rmtree(temp_dir)
+
+
+def parse_args() -> argparse.Namespace:
+    patch_prog = shutil.which("patch")
+    parser = argparse.ArgumentParser(description="Patch a Python wheel file")
+    parser.set_defaults(
+        patch_prog=Path(patch_prog) if patch_prog else None,
+        dest_dir=".",
+        strip_count=1,
+    )
+    parser.add_argument("--wheel", "-w", required=True, help="The wheel file to patch")
+    parser.add_argument(
+        "--patch-dir",
+        "-p",
+        required=True,
+        help="Directory containing patches to apply to the wheel",
+    )
+    parser.add_argument(
+        "--dest-dir",
+        "-d",
+        help="The directory to save the patched wheel. Default: %(default)r",
+    )
+    parser.add_argument(
+        "--suffix",
+        "-s",
+        required=True,
+        help="The suffix to append to the version in the wheel filename. "
+        "A leading '+' will be added if not present. "
+        "For example, '--wheel torch-2.1.0-cp38-cp38-manylinux1_x86_64.whl --suffix stripe.4' "
+        "creates 'torch-2.1.0+stripe.4-cp38-cp38-manylinux1_x86_64.whl'. "
+        "This patched wheel can be installed with the requirement 'torch==2.1.0+stripe.4'.",
+    )
+    parser.add_argument(
+        "--patch-prog",
+        "-P",
+        help="Path to 'patch' executable. Default: '%(default)s'.",
+    )
+    parser.add_argument(
+        "--strip-count",
+        help="Number of leading path components to strip from filenames in the patch. "
+        "Default: %(default)d.",
+    )
+    args = parser.parse_args()
+    if args.patch_prog:
+        args.patch_prog = Path(args.patch_prog)
+    else:
+        raise ValueError("Can't find 'patch'")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    new_wheel_path, requirement = patch_wheel(
+        src_wheel=Path(args.wheel),
+        dest_dir=Path(args.dest_dir),
+        patch_dir=Path(args.patch_dir),
+        suffix=args.suffix,
+        patch_prog=Path(args.patch_prog),
+        strip_count=args.strip_count,
+    )
+    print(f"Patched wheel written to {new_wheel_path}\n")
+    print(
+        f"Use 'pip install {requirement}' to install the patched wheel\n"
+        + "after it has been uploaded to a Python package index."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
